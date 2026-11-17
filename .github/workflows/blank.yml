@@ -1,0 +1,284 @@
+# This is a basic workflow to help you get started with Actions
+
+name: AweYuki Action build
+
+permissions:
+  contents: write
+# Controls when the workflow will run
+on:
+  # Allows you to run this workflow manually from the Actions tab
+  workflow_dispatch:
+    inputs:
+      URL:
+        description: " Stock ROM URL"
+        required: true
+      BRANCH:
+        required: true
+        default: "auto"
+      COMMIT_HASH:
+        description: "leave empty for latest"
+        required: false
+        default: ""
+      EXT4:
+        description: "FORCE EXT4"
+        type: boolean
+        default: false
+      UPLOAD_GOFILE:
+        description: "Upload to Gofile"
+        type: boolean
+        default: false
+      UPLOAD_PIXELDRAIN:
+        description: "Upload to Pixeldrain"
+        type: boolean
+        default: true
+      UPLOAD_GDRIVE:
+        description: "Upload to Google drive"
+        type: boolean
+        default: true
+      SHOW_LOG:
+        description: "Show detailed build log"
+        type: boolean
+        default: false
+# A workflow run is made up of one or more jobs that can run sequentially or in parallel
+jobs:
+  # This workflow contains a single job called "build"
+  build:
+      # The type of runner that the job will run on
+    runs-on: ubuntu-latest 
+    # Steps represent a sequence of tasks that will be executed as part of the job
+    steps:
+      - name: Checkout main
+     # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          fetch-tags: false
+
+      - name: Check free disk space
+        id: diskcheck
+        run: |
+          FREE_GB=$(df -BG / | awk 'NR==2 {gsub("G","",$4); print $4}')
+          echo "Free disk space: ${FREE_GB}GB"
+          if [ "$FREE_GB" -lt 50 ]; then
+            echo "need_cleanup=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "need_cleanup=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Maximize build disk space
+        if: steps.diskcheck.outputs.need_cleanup == 'true'
+        uses: AdityaGarg8/remove-unwanted-software@v5.1
+        with:
+          remove-dotnet: 'true'
+          remove-android: 'true'
+          remove-haskell: 'true'
+          remove-codeql: 'true'
+          remove-docker-images: 'true'
+          remove-large-packages: 'true'
+          remove-cached-tools: 'true'
+          
+      - name: Setup
+        run: |
+          sudo timedatectl set-timezone Asia/Ho_Chi_Minh
+          sudo apt-get update
+          sudo apt-get install -y \
+            android-sdk-libsparse-utils aria2 curl device-tree-compiler erofs-utils \
+            g++ gcc git jq lz4 openjdk-17-jdk openjdk-17-jdk-headless openssh-client \
+            p7zip-full python-is-python3 python3 python3-pip python3-protobuf rsync xz-utils zip zipalign zlib1g-dev
+          # sudo pip install --break-system-packages --quiet -r requirements.txt
+
+
+      - name: Set name
+        env:
+          IN_URL: ${{ github.event.inputs.URL }}
+          IN_BRANCH: ${{ github.event.inputs.BRANCH }}
+          IN_COMMIT: ${{ github.event.inputs.COMMIT_HASH }}
+        run: |
+          set -e
+          DATE=$(TZ=Asia/Ho_Chi_Minh date +"%y%m%d")
+          ROM_URL="$IN_URL"
+          BRANCH="$IN_BRANCH"
+          BUILD_COMMIT="$IN_COMMIT"
+
+          URL_CLEAN="${ROM_URL%%\?*}"
+          URL_CLEAN="${URL_CLEAN%/download}"
+          ROM_NAME="$(basename "$URL_CLEAN")"
+
+          if [[ "$ROM_NAME" == *"-OS"* ]]; then
+            if [[ "$ROM_NAME" =~ ^([a-z0-9]+)(_[a-z_]+)?-ota_full-(OS[0-9.]+)\.([A-Z0-9]+)-user-[0-9.]+-.*\.zip$ ]]; then
+              DEVICE="${BASH_REMATCH[1]^^}"
+              OS_VER="${BASH_REMATCH[3]}"
+              REGION="${BASH_REMATCH[4]}"
+            else
+              echo "::error::Không parse được tên ROM HyperOS: $ROM_NAME"
+              exit 1
+            fi
+          elif [[ "$ROM_NAME" == miui_* ]]; then
+            if [[ "$ROM_NAME" =~ ^miui_([A-Za-z0-9]+)_(V[0-9.]+)\.([A-Z0-9]+)_[a-f0-9]+_[0-9.]+\.zip$ ]]; then
+              DEVICE="${BASH_REMATCH[1]%Global}"
+              DEVICE="${DEVICE^^}"
+              OS_VER="${BASH_REMATCH[2]}"
+              REGION="${BASH_REMATCH[3]}"
+            else
+              echo "::error::Không parse được tên ROM MIUI: $ROM_NAME"
+              exit 1
+            fi
+          else
+            echo "::error::ROM không phải HyperOS (-OS) hay MIUI (miui_): $ROM_NAME"
+            exit 1
+          fi
+
+          NAME="AweYuki_${DEVICE}_${OS_VER}.${REGION}_${DATE}"
+
+          {
+            echo "ROM_URL=$ROM_URL"
+            echo "BRANCH=$BRANCH"
+            echo "BUILD_COMMIT=$BUILD_COMMIT"
+            echo "ROM_NAME=$ROM_NAME"
+            echo "NAME=$NAME"
+          } >> "$GITHUB_ENV"
+
+          echo "🌿 BRANCH=$BRANCH"
+          echo "🔖 COMMIT_HASH=${BUILD_COMMIT:-latest}"
+          echo "📝 ROM_NAME=$ROM_NAME"
+          echo "📦 NAME=$NAME"
+      - name: Download
+        run: |
+          set -e
+          mkdir -p "$GITHUB_WORKSPACE/ROM"
+          cd "$GITHUB_WORKSPACE/ROM"
+
+
+            echo "⬇️ Downloading Stock OTA ROM..."
+            timeout 9000 aria2c -s16 -x16 -j"$(nproc)" -c -U "Mozilla/5.0" \
+              -o "${NAME}.zip" "$ROM_URL" \
+              || { echo "::error::OTA download thất bại"; exit 1; }
+
+
+          [ -s "$GITHUB_WORKSPACE/ROM/${NAME}.zip" ] \
+            || { echo "::error::Downloaded ROM is missing or empty"; exit 1; }
+          echo "✅ Download complete: $(du -h "$GITHUB_WORKSPACE/ROM/${NAME}.zip" | cut -f1)"
+
+      - name: Build
+        id: build
+        env:
+          EXT4: ${{ github.event.inputs.EXT4 }}
+          SHOW_LOG: ${{ github.event.inputs.SHOW_LOG }}
+        run: |
+          set -e
+          cd "$HOME"
+
+          bash "$GITHUB_WORKSPACE/setup.sh" "$GITHUB_ENV" "$NAME"
+
+          source "$GITHUB_ENV" 2>/dev/null || true
+
+          if [ -z "${ROM_OUTPUT:-}" ] || [ ! -f "$ROM_OUTPUT" ]; then
+            echo "⚠️ ROM_OUTPUT chưa được set, đang auto-detect..."
+            ROM_OUTPUT=$(find "$HOME" -maxdepth 6 -name "*.zip" \
+              ! -name "${NAME}.zip" \
+              ! -path "*/ROM/${NAME}.zip" \
+              | head -1)
+          fi
+
+          if [ -z "${ROM_OUTPUT:-}" ] || [ ! -f "$ROM_OUTPUT" ]; then
+            echo "::error::Không tìm được ROM output sau build. ROM_OUTPUT='${ROM_OUTPUT:-}'"
+            exit 1
+          fi
+
+          echo "ROM_OUTPUT=$ROM_OUTPUT" >> "$GITHUB_ENV"
+          echo "✅ ROM_OUTPUT=$ROM_OUTPUT"
+          echo "✅ ROM size: $(du -sh "$ROM_OUTPUT" | cut -f1)"
+
+      - name: Upload to Gofile
+        if: ${{ github.event.inputs.UPLOAD_GOFILE == 'true' }}
+        continue-on-error: true
+        run: |
+          echo "📤 Uploading lên Gofile..."
+          SERVER=$(curl -sf "https://api.gofile.io/servers" | jq -r '.data.servers[0].name')
+          if [ -z "$SERVER" ] || [ "$SERVER" = "null" ]; then
+            echo "::warning::Không lấy được Gofile server"
+          else
+            RESPONSE=$(curl -sf \
+              -H "Authorization: Bearer ${{ secrets.GOFILE_API_KEY }}" \
+              -F "file=@${ROM_OUTPUT}" \
+              "https://${SERVER}.gofile.io/contents/uploadfile")
+            GOFILE_LINK=$(echo "$RESPONSE" | jq -r '.data.downloadPage // empty')
+            if [ -n "$GOFILE_LINK" ]; then
+              echo "GOFILE_LINK=$GOFILE_LINK" >> "$GITHUB_ENV"
+              echo "✅ GOFILE_LINK=$GOFILE_LINK"
+            else
+              echo "::warning::Gofile upload thất bại: $RESPONSE"
+            fi
+          fi
+
+      - name: Upload to Pixeldrain
+        if: ${{ github.event.inputs.UPLOAD_PIXELDRAIN == 'true' }}
+        continue-on-error: true
+        run: |
+          echo "📤 Upload lên Pixeldrain..."
+          RESPONSE=$(curl -sf \
+            -u ":${{ secrets.PIXELDRAIN_API_KEY }}" \
+            -F "file=@${ROM_OUTPUT}" \
+            "https://pixeldrain.com/api/file")
+          PD_ID=$(echo "$RESPONSE" | jq -r '.id // empty')
+
+          if [ -n "$PD_ID" ]; then
+            PIXEL_LINK="https://pixeldrain.com/u/${PD_ID}"
+            PIXEL_CDN="https://cdn.pixeldrain.eu.cc/${PD_ID}"
+            echo "PIXEL_LINK=$PIXEL_LINK" >> "$GITHUB_ENV"
+            echo "PIXEL_CDN=$PIXEL_CDN" >> "$GITHUB_ENV"
+            echo "✅ PIXEL_LINK=$PIXEL_LINK"
+            echo "✅ PIXEL_CDN=$PIXEL_CDN"
+          else
+            echo "::warning::Pixeldrain upload thất bại: $RESPONSE"
+          fi
+
+      - name: Telegram Notification — Success
+        if: success()
+        env:
+          TG_CHAT: ${{ secrets.TELEGRAM_TO }}
+          TG_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          IN_GOFILE: ${{ github.event.inputs.UPLOAD_GOFILE }}
+          IN_PIXEL: ${{ github.event.inputs.UPLOAD_PIXELDRAIN }}
+        run: |
+          ROM_FILENAME=$(basename "$ROM_OUTPUT")
+          ROM_SIZE=$(du -sh "$ROM_OUTPUT" 2>/dev/null | cut -f1)
+
+          ROWS="[]"
+          append_btn() {
+            ROWS=$(printf '%s' "$ROWS" | jq --arg l "$1" --arg u "$2" '. += [[{"text":$l,"url":$u}]]')
+          }
+          [ -n "${GOFILE_LINK:-}" ] && append_btn "📥 Gofile" "$GOFILE_LINK"
+          [ -n "${PIXEL_LINK:-}" ] && append_btn "📥 Pixeldrain" "$PIXEL_LINK"
+          [ -n "${PIXEL_CDN:-}" ] && append_btn "⚡ Pixeldrain CDN" "$PIXEL_CDN"
+
+          TG_TEXT=$(printf '✅ <b>Build thành công!</b>\n📦 <b>File:</b> <code>%s</code>\n📏 <b>Size:</b> %s\n\n☁️ <b>Upload:</b>\n• Gofile: <code>%s</code>\n• Pixeldrain: <code>%s</code>' \
+            "$ROM_FILENAME" "${ROM_SIZE:-?}" "$IN_GOFILE" "$IN_PIXEL")
+
+          PAYLOAD=$(jq -n \
+            --arg chat "$TG_CHAT" --arg text "$TG_TEXT" --argjson kb "$ROWS" \
+            '{chat_id:$chat, parse_mode:"HTML", text:$text, reply_markup:{inline_keyboard:$kb}}')
+
+          curl -s -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+            -H "Content-Type: application/json" -d "$PAYLOAD"
+
+      - name: Telegram Notification — Failure
+        if: failure()
+        env:
+          TG_CHAT: ${{ secrets.TELEGRAM_TO }}
+          TG_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+        run: |
+          LOG_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          TG_TEXT=$(printf '❌ <b>Build thất bại!</b>\n🔗 <a href="%s">Xem log chi tiết</a>' "$LOG_URL")
+
+          PAYLOAD=$(jq -n \
+            --arg chat "$TG_CHAT" --arg text "$TG_TEXT" --arg log_url "$LOG_URL" \
+            '{chat_id:$chat, parse_mode:"HTML", text:$text,
+              reply_markup:{inline_keyboard:[[{"text":"🔍 Xem Log","url":$log_url}]]}}')
+
+          curl -s -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+            -H "Content-Type: application/json" -d "$PAYLOAD"
+
+      - name: Cleanup
+        if: always()
+        run: |
+          rm -rf "$GITHUB_WORKSPACE/ROM" || true
